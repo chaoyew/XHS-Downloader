@@ -2,7 +2,7 @@
 
 import asyncio
 import sys
-from asyncio import CancelledError
+from asyncio import CancelledError, QueueEmpty
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -383,6 +383,33 @@ class GuiBackend:
                     await self._process_task(task)
             finally:
                 self.task_queue.task_done()
+            await self._abort_pending_tasks()
+
+    async def _abort_pending_tasks(self) -> None:
+        """XHS 触发停止信号时，取消所有排队中的任务并清空任务队列。"""
+
+        if not self.xhs.stop_flag:
+            return
+        aborted = 0
+        for task in self.tasks.values():
+            if task.state == "pending":
+                task.state = "cancelled"
+                aborted += 1
+        while not self.task_queue.empty():
+            with suppress(QueueEmpty):
+                self.task_queue.get_nowait()
+                self.task_queue.task_done()
+        if self.monitor_task and not self.monitor_task.done():
+            self.monitor_task.cancel()
+            with suppress(CancelledError):
+                await self.monitor_task
+            self.monitor_task = None
+            self.monitor.update({"active": False, "state": "stopped"})
+        self.xhs.resume_tasks()
+        self.add_log(
+            _("已停止任务并清空任务列表，取消 {0} 个排队任务").format(aborted),
+            "warning",
+        )
 
     async def _process_task(self, task: TaskState) -> None:
         """执行单个作品的跳过判断、提取和下载，并更新最终状态。"""
@@ -406,6 +433,7 @@ class GuiBackend:
                     progress_callback=self.on_file_progress,
                     task_id=task.task_id,
                     result_callback=capture_statistics,
+                    reset_state=False,
                 )
             else:
                 await self.xhs.deal_script_tasks(

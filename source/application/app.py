@@ -10,6 +10,7 @@ from asyncio import (
 )
 from contextlib import suppress
 from datetime import datetime
+from json import JSONDecodeError
 from re import compile
 from textwrap import dedent
 from types import SimpleNamespace
@@ -217,6 +218,9 @@ class XHS:
         self.clipboard_cache: str = ""
         self.queue = Queue()
         self.event = Event()
+        self.max_note_count = 500
+        self.extract_count = 0
+        self.stop_flag = False
         self.script = None
         self.script_task_handler: Callable[..., Awaitable[object]] | None = None
         self.init_script_server(
@@ -317,6 +321,7 @@ class XHS:
         task_id: str | None = None,
         result_callback: Callable[[dict], None] | None = None,
         proxy: str | None = None,
+        reset_state: bool = True,
     ) -> list[dict]:
         if not (
             urls := await self.extract_links(
@@ -326,21 +331,26 @@ class XHS:
         ):
             self.logging(_("提取小红书作品链接失败"), WARNING)
             return []
+        self._reset_task_state(reset_count=reset_state)
         statistics = new_statistics(len(urls))
         self.logging(_("共 {0} 个小红书作品待处理...").format(statistics.all))
-        result = [
-            await self.__deal_extract(
-                i,
-                download,
-                index,
-                check_record=check_record,
-                proxy=proxy,
-                count=statistics,
-                progress_callback=progress_callback,
-                task_id=task_id,
+        result = []
+        for i in urls:
+            if self.event.is_set():
+                self.logging(_("任务已停止，剩余链接不再处理"), WARNING)
+                break
+            result.append(
+                await self.__deal_extract(
+                    i,
+                    download,
+                    index,
+                    check_record=check_record,
+                    proxy=proxy,
+                    count=statistics,
+                    progress_callback=progress_callback,
+                    task_id=task_id,
+                )
             )
-            for i in urls
-        ]
         self.show_statistics(
             statistics,
         )
@@ -382,6 +392,7 @@ class XHS:
         if not url:
             self.logging(_("提取小红书作品链接失败"), WARNING)
             return
+        self._reset_task_state()
         if index:
             await self.__deal_extract(
                 url[0],
@@ -391,7 +402,10 @@ class XHS:
             )
         else:
             statistics = new_statistics(len(url))
-            [
+            for u in url:
+                if self.event.is_set():
+                    self.logging(_("任务已停止，剩余链接不再处理"), WARNING)
+                    break
                 await self.__deal_extract(
                     u,
                     download,
@@ -399,8 +413,6 @@ class XHS:
                     check_record=check_record,
                     count=statistics,
                 )
-                for u in url
-            ]
             self.show_statistics(
                 statistics,
             )
@@ -455,10 +467,30 @@ class XHS:
             cookie=cookie,
             proxy=proxy,
         )
-        namespace = self.__generate_data_object(html)
+        #self.logging(_("开始处理作品：{0}").format(html))
+
+        try:
+            namespace = self.__generate_data_object(html)
+        except JSONDecodeError as error:
+            # 页面数据为空或非预期格式时，JSON 解析会抛出该异常，此时应终止任务
+            self.logging(
+                _("{0} 数据解析失败：{1}，页面可能为空或返回了非预期内容").format(
+                    id_,
+                    error,
+                ),
+                ERROR,
+            )
+            count.fail += 1
+            self._abort_tasks(
+                _("数据解析失败，已停止任务并清空任务列表"),
+            )
+            return {}
         if not namespace:
             self.logging(_("{0} 获取数据失败").format(id_), ERROR)
             count.fail += 1
+            self._abort_tasks(
+                _("获取数据失败，已停止任务并清空任务列表"),
+            )
             return {}
         return namespace
 
@@ -525,6 +557,40 @@ class XHS:
         # await sleep_time()
         return data
 
+    def _abort_tasks(self, reason: str) -> None:
+        """停止当前任务并清空任务列表。"""
+
+        self.stop_flag = True
+        self.event.set()
+        while not self.queue.empty():
+            with suppress(QueueEmpty):
+                self.queue.get_nowait()
+        self.logging(reason, WARNING)
+
+    def _count_extracted_note(self) -> None:
+        """累计已提取的笔记数量，达到上限时停止任务并清空任务列表。"""
+
+        self.extract_count += 1
+        if self.extract_count >= self.max_note_count:
+            self._abort_tasks(
+                _("已提取 {0} 次链接对应的笔记图片，任务停止").format(
+                    self.max_note_count,
+                ),
+            )
+
+    def _reset_task_state(self, reset_count: bool = True) -> None:
+        """开始新任务前重置停止信号；reset_count 为 True 时同时重置提取计数。"""
+
+        self.event.clear()
+        self.stop_flag = False
+        if reset_count:
+            self.extract_count = 0
+
+    def resume_tasks(self) -> None:
+        """清空停止状态与提取计数，允许后续任务继续执行。"""
+
+        self._reset_task_state()
+
     async def __deal_extract(
         self,
         url: str,
@@ -575,6 +641,7 @@ class XHS:
             task_id=task_id,
         )
         self.logging(_("作品处理完成：{0}").format(id_))
+        self._count_extracted_note()
         return data
 
     async def deal_script_tasks(
@@ -707,7 +774,7 @@ class XHS:
             ),
             style=MASTER,
         )
-        self.event.clear()
+        self._reset_task_state()
         copy("")
         await gather(
             self.__get_link(delay),
