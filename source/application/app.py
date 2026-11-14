@@ -480,6 +480,14 @@ class XHS:
                 ),
                 ERROR,
             )
+            self.logging(
+                _("{0} 返回的 HTML 内容（共 {1} 个字符）：\n{2}").format(
+                    id_,
+                    len(html or ""),
+                    html or _("<空内容>"),
+                ),
+                WARNING,
+            )
             count.fail += 1
             self._abort_tasks(
                 _("数据解析失败，已停止任务并清空任务列表"),
